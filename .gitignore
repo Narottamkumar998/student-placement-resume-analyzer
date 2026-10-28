@@ -1,0 +1,13 @@
+.venv/
+venv/
+**pycache**/
+*.py[cod]
+.ipynb_checkpoints/
+.virtual_documents/
+.env
+.streamlit/secrets.toml
+student_career.db
+*.db
+*.sqlite
+*.sqlite3
+*.pdf
