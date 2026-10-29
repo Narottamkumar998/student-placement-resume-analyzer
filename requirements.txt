@@ -2,6 +2,6 @@ streamlit
 pandas
 numpy
 scipy
-joblib
+joblib==1.4.2
 scikit-learn==1.5.1
 PyMuPDF
