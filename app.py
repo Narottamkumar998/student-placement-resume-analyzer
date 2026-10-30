@@ -1,6 +1,8 @@
 import os
 import hmac
-import sqlite3
+from contextlib import contextmanager
+import mysql.connector
+from mysql.connector import IntegrityError, Error as MySQLError
 import tempfile
 from pathlib import Path
 
@@ -31,7 +33,6 @@ st.set_page_config(
 )
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "student_career.db"
 PLACEMENT_PIPELINE_PATH = BASE_DIR / "models" / "placement_pipeline.pkl"
 
 
@@ -46,33 +47,78 @@ def load_placement_pipeline():
 
 
 # =====================================================
-# 2. DATABASE CONNECTION
+# 2. MYSQL DATABASE CONNECTION
 # =====================================================
 
+def get_setting(name, default=""):
+    """Read configuration from Streamlit secrets first, then environment."""
+    try:
+        value = st.secrets.get(name, None)
+        if value is not None:
+            return value
+    except Exception:
+        pass
+    return os.environ.get(name, default)
+
+
+@contextmanager
 def get_connection():
-    return sqlite3.connect(DB_PATH)
+    """Open a MySQL connection and safely commit/rollback/close it."""
+    connection = mysql.connector.connect(
+        host=get_setting("MYSQL_HOST"),
+        port=int(get_setting("MYSQL_PORT", "3306")),
+        user=get_setting("MYSQL_USER"),
+        password=get_setting("MYSQL_PASSWORD"),
+        database=get_setting("MYSQL_DATABASE"),
+        autocommit=False,
+        connection_timeout=20,
+        ssl_disabled=False,
+    )
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def initialize_database():
-    with get_connection() as connection:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS students (
-                user_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                full_name TEXT NOT NULL,
-                email TEXT NOT NULL UNIQUE,
-                phone TEXT,
-                college TEXT NOT NULL,
-                degree TEXT NOT NULL,
-                branch TEXT NOT NULL,
-                graduation_year INTEGER NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            """
+    required = ["MYSQL_HOST", "MYSQL_USER", "MYSQL_PASSWORD", "MYSQL_DATABASE"]
+    missing = [key for key in required if not get_setting(key)]
+    if missing:
+        raise RuntimeError(
+            "MySQL is not configured. Add these values to the hosting provider's "
+            "environment variables/secrets: " + ", ".join(missing)
         )
 
+    with get_connection() as connection:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS students (
+                user_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                full_name VARCHAR(150) NOT NULL,
+                email VARCHAR(254) NOT NULL UNIQUE,
+                phone VARCHAR(30),
+                college VARCHAR(200) NOT NULL,
+                degree VARCHAR(50) NOT NULL,
+                branch VARCHAR(100) NOT NULL,
+                graduation_year SMALLINT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        cursor.close()
 
-initialize_database()
+
+try:
+    initialize_database()
+except Exception as db_error:
+    st.error("Database connection/setup failed. Check your MySQL credentials and network access.")
+    st.exception(db_error)
+    st.stop()
 
 
 # =====================================================
@@ -104,19 +150,12 @@ def register_student(
 ):
     try:
         with get_connection() as connection:
-            cursor = connection.execute(
+            cursor = connection.cursor()
+            cursor.execute(
                 """
                 INSERT INTO students
-                (
-                    full_name,
-                    email,
-                    phone,
-                    college,
-                    degree,
-                    branch,
-                    graduation_year
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                (full_name, email, phone, college, degree, branch, graduation_year)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     full_name.strip(),
@@ -128,57 +167,50 @@ def register_student(
                     graduation_year,
                 ),
             )
+            new_id = cursor.lastrowid
+            cursor.close()
+            return new_id, None
 
-            return cursor.lastrowid, None
-
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         return None, "This email is already registered."
-
-    except sqlite3.Error as error:
+    except MySQLError as error:
         return None, f"Database error: {error}"
 
 
 def get_student_by_id(user_id):
     with get_connection() as connection:
-        connection.row_factory = sqlite3.Row
-
-        student = connection.execute(
-            "SELECT * FROM students WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-
-    return dict(student) if student else None
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM students WHERE user_id = %s", (user_id,))
+        student = cursor.fetchone()
+        cursor.close()
+    return student
 
 
 def get_all_students():
+    query = """
+        SELECT user_id, full_name, email, phone, college, degree, branch,
+               graduation_year, created_at
+        FROM students
+        ORDER BY user_id DESC
+    """
     with get_connection() as connection:
-        return pd.read_sql_query(
-            """
-            SELECT
-                user_id,
-                full_name,
-                email,
-                phone,
-                college,
-                degree,
-                branch,
-                graduation_year,
-                created_at
-            FROM students
-            ORDER BY user_id DESC
-            """,
-            connection,
-        )
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        cursor.close()
+    return pd.DataFrame(rows, columns=[
+        "user_id", "full_name", "email", "phone", "college", "degree",
+        "branch", "graduation_year", "created_at"
+    ])
 
 
 def delete_student(user_id):
     with get_connection() as connection:
-        cursor = connection.execute(
-            "DELETE FROM students WHERE user_id = ?",
-            (user_id,),
-        )
-
-        return cursor.rowcount > 0
+        cursor = connection.cursor()
+        cursor.execute("DELETE FROM students WHERE user_id = %s", (user_id,))
+        deleted = cursor.rowcount > 0
+        cursor.close()
+    return deleted
 
 
 # =====================================================
@@ -186,7 +218,7 @@ def delete_student(user_id):
 # =====================================================
 
 def verify_admin_password(password):
-    saved_password = os.environ.get("ADMIN_PASSWORD", "")
+    saved_password = get_setting("ADMIN_PASSWORD", "")
 
     if not saved_password:
         return False
@@ -405,11 +437,16 @@ elif page == "Home":
                 "Graduation Year": student["graduation_year"],
             }
 
+            # Convert values to strings so PyArrow does not receive
+            # mixed Python types (for example, text + integer year)
+            # in the same DataFrame column.
+            details_df = pd.DataFrame(
+                [(field, str(value)) for field, value in details.items()],
+                columns=["Field", "Value"],
+            )
+
             st.dataframe(
-                pd.DataFrame(
-                    details.items(),
-                    columns=["Field", "Value"],
-                ),
+                details_df,
                 hide_index=True,
                 use_container_width=True,
             )
@@ -982,7 +1019,7 @@ elif page == "Admin Login":
 
         else:
 
-            if not os.environ.get("ADMIN_PASSWORD"):
+            if not get_setting("ADMIN_PASSWORD"):
 
                 st.error(
                     "Admin password is not configured. "
