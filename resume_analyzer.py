@@ -1,11 +1,3 @@
-"""
-Resume Analyzer module for the Student Career & Placement System.
-
-IMPORTANT:
-- Save this file as: resume_analyzer.py
-- Keep it in the same folder as app.py.
-- Do NOT add `from resume_analyzer import ...` inside this file.
-"""
 
 import re
 
